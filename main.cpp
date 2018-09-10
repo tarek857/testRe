@@ -1,4 +1,6 @@
 #include <CommlayerAPI.h>
+#include <SafeQueue.h>
+#include <ServiceMessage.h>
 
 #include <unistd.h>  //usleep
 #include <iostream>
@@ -9,6 +11,12 @@ static char red[] = "\033[1;31m";
 static char green[] = "\033[1;32m";
 static char magenta[] = "\033[1;35m";
 static char nocolor[] = "\033[0m";
+
+static std::ostream& operator<<(std::ostream& os, const CLRequestToken& request)
+{
+    os << "REQ[" << request.uuid().urn() << " " << request.servicePath() << " " << request.expirationDate() << "]";
+    return os;
+}
 
 static std::ostream& operator<<(std::ostream& os, const ByteArray& bin)
 {
@@ -28,8 +36,8 @@ static std::ostream& operator<<(std::ostream& os, const ResponseStatusCode s)
         case ResponseStatusCode::BAD_REQUEST:
             os << "BAD_REQUEST";
             break;
-        case ResponseStatusCode::REQUEST_TIME_OUT:
-            os << "REQUEST_TIME_OUT";
+        case ResponseStatusCode::BUSY:
+            os << "BUSY";
             break;
         case ResponseStatusCode::NOT_FOUND:
             os << "NOT_FOUND";
@@ -54,24 +62,23 @@ static std::ostream& operator<<(std::ostream& os, const GatewayMessage& message)
         {
             const GatewayMessage& e = message;
             os << "Event\n["
-               << "\n  id: " << e.id() << "\n  payload: " << e.payload() << "\n  servicePath: " << e.servicePath()
-               << "\n]\n";
+               << "\n  id: " << e.id().urn() << "\n  payload: " << e.payload() << "\n  servicePath: " << e.servicePath() << "\n]\n";
         }
         break;
         case GatewayMessageType::REQUEST:
         {
             const GatewayMessage& r = message;
             os << "Request["
-               << "\n  id: " << r.id() << "\n  payload: " << r.payload() << "\n  servicePath: " << r.servicePath()
-               << "\n]\n";
+               << "\n  id: " << r.id().urn() << "\n  payload: " << r.payload() << "\n  servicePath: " << r.servicePath()
+               << "\n  requestToken:" << r.requestToken() << "\n]\n";
         }
         break;
         case GatewayMessageType::RESPONSE:
         {
             const GatewayMessage& r = message;
             os << "Response["
-               << "\n  id: " << r.id() << "\n  requestID: " << r.requestId() << "\n  payload: " << r.payload()
-               << "\n  servicePath: " << r.servicePath() << "\n  statusCode: " << r.statusCode() << "\n]\n";
+               << "\n  id: " << r.id().urn() << "\n  payload: " << r.payload() << "\n  servicePath: " << r.servicePath()
+               << "\n  statusCode: " << r.statusCode() << "\n]\n";
         }
         break;
         default:
@@ -85,15 +92,14 @@ class Tupel
   public:
     CommlayerAPI& bridge;
     bool& end;
-    inline Tupel(CommlayerAPI& bridge, bool& end) : bridge(bridge), end(end), _mutex(new pthread_mutex_t)
-    {
-        pthread_mutex_init(_mutex, 0);
-    }
+    inline Tupel(CommlayerAPI& bridge, bool& end) : bridge(bridge), end(end), _mutex(new pthread_mutex_t) { pthread_mutex_init(_mutex, 0); }
     inline void lock() { pthread_mutex_lock(_mutex); }
     inline void unlock() { pthread_mutex_unlock(_mutex); }
     ~Tupel() { pthread_mutex_destroy(_mutex); }
+    inline SafeQueue<CLRequestToken>& request() { return _request; }
   private:
     pthread_mutex_t* _mutex;
+    SafeQueue<CLRequestToken> _request;
 };
 
 static void* func(void* data)
@@ -105,11 +111,14 @@ static void* func(void* data)
     bool& end = tupel->end;
     while (!end)
     {
-        if (tupel->bridge.receiveSize())
+        if (tupel->bridge.receiveMessageSize())
         {
             tupel->lock();
-            const GatewayMessage gatewayMessage = tupel->bridge.dequeueReceive();
+            const GatewayMessage gatewayMessage = tupel->bridge.dequeueReceiveMessage();
             std::cout << red << "reveived Message: " << gatewayMessage << std::endl << magenta << std::flush;
+
+            if (gatewayMessage.type().isARequest())
+                tupel->request().push_front(gatewayMessage.requestToken());
             tupel->unlock();
         }
         tupel->unlock();
@@ -121,8 +130,7 @@ static void* func(void* data)
     pthread_exit(NULL);
 }
 
-static void readBase(ByteArray& payload, std::string& servicePath, uint32_t& ttl, int64_t& createdAt,
-                     MessageCompression& compression, bool& persist)
+static void readBase(ByteArray& payload, std::string& servicePath, uint32_t& ttl, int64_t& createdAt, MessageCompression& compression, bool& persist)
 {
     std::cout << " payload: ";
     std::string sPayload;
@@ -141,7 +149,7 @@ static void readBase(ByteArray& payload, std::string& servicePath, uint32_t& ttl
         std::string tmp;
         std::cin >> tmp;
         if (tmp.compare("now") == 0)
-            createdAt = time(0);
+            createdAt = time(0) * 1000;
         else
         {
             std::stringstream ss;
@@ -210,8 +218,7 @@ int main(int argc, char* argv[])
     paths.push_back("set");
     paths.push_back("get");
     paths.push_back("post");
-    ServiceSpecificationValues values(name, "testService", "first and last", paths, "plaintext",
-                                      "This is only a test service. It has no purpose.");
+    ServiceSpecificationValues values(name, "testService", "first and last", paths, "plaintext", "This is only a test service. It has no purpose.");
     CommlayerAPI bridge(values);
     Tupel tupel(bridge, end);
     pthread_t thread;
@@ -234,7 +241,7 @@ int main(int argc, char* argv[])
             MessageCompression compression = MessageCompression::notCompress();
             bool persist;
             readBase(payload, servicePath, ttl, createdAt, compression, persist);
-            bridge.sendEvent(payload, servicePath, ttl, compression, persist);
+            bridge.sendEvent(payload, servicePath, ttl, compression, persist, nullptr);
         }
         else if (input.compare("request") == 0)
         {
@@ -245,20 +252,17 @@ int main(int argc, char* argv[])
             MessageCompression compression = MessageCompression::notCompress();
             bool persist;
             readBase(payload, servicePath, ttl, createdAt, compression, persist);
-            bridge.sendRequest(payload, servicePath, ttl, compression, persist);
+            bridge.sendRequest(payload, servicePath, ttl, compression, persist, nullptr);
         }
         else if (input.compare("response") == 0)
         {
             std::string servicePath;
-            uint32_t requestID;
             ByteArray payload;
             uint32_t ttl;
             int64_t createdAt;
             MessageCompression compression = MessageCompression::notCompress();
             bool persist;
             readBase(payload, servicePath, ttl, createdAt, compression, persist);
-            std::cout << "  requestID: ";
-            std::cin >> requestID;
             uint8_t choice;
             std::cout << "  statusCode(0-5): ";
             std::cin >> choice;
@@ -266,7 +270,14 @@ int main(int argc, char* argv[])
             if (choice > 5)
                 choice = 0;
             ResponseStatusCode statusCode = ResponseStatusCode::createByValue(choice);
-            bridge.sendResponse(requestID, payload, servicePath, ttl, compression, persist, statusCode);
+            if (tupel.request().size() == 0)
+                std::cout << "No cl request token saved. Dont send the response.\n";
+            else
+            {
+                CLRequestToken requestToken = tupel.request().pop_back();
+                std::cout << "Take request Token: " << requestToken << "\n";
+                bridge.sendResponse(requestToken, payload, servicePath, ttl, compression, persist, statusCode, nullptr);
+            }
         }
     }
     end = true;
